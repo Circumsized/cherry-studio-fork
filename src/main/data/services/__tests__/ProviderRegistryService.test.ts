@@ -7,10 +7,15 @@ import { readFileSync } from 'node:fs'
 
 import { setupTestDatabase } from '@test-helpers/db'
 import { MockMainDbServiceUtils } from '@test-mocks/main/DbService'
+import { MockMainPreferenceServiceUtils } from '@test-mocks/main/PreferenceService'
 import { eq } from 'drizzle-orm'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { userProviderTable } from '@data/db/schemas/userProvider'
+import {
+  MODEL_DISPLAY_NAME_SHOW_RAW_ID,
+  providerRegistryService
+} from '@data/services/ProviderRegistryService'
 import { providerService } from '@data/services/ProviderService'
 import { generateOrderKeyBetween } from '@data/services/utils/orderKey'
 import { createUniqueModelId } from '@shared/data/types/model'
@@ -797,6 +802,38 @@ describe('ProviderRegistryService', () => {
 
       expect(regional.name).toBe('us.anthropic.claude-sonnet-4-5-v1:0')
       expect(regional.apiModelId).toBe('us.anthropic.claude-sonnet-4-5-v1:0')
+    })
+
+    it('uses the decorated display name when the raw-id preference is disabled', async () => {
+      MockMainPreferenceServiceUtils.setPreferenceValue(MODEL_DISPLAY_NAME_SHOW_RAW_ID, false)
+      try {
+        setupRegistryData()
+
+        const models = providerRegistryService.resolveModels('openai', [
+          'custom-model',
+          'gpt-5.6-sol',
+          'mf/glm-5.3',
+          'mf/deepseek-v4-flash-0731'
+        ])
+
+        // Unmatched ids are prettified instead of shown raw when the user opts into decorated names:
+        // hyphen → space + title-cased tokens, slash namespace → `Prefix:`, dated snapshot in parens.
+        expect(models.map((model) => model.name)).toEqual([
+          'Custom Model',
+          'GPT 5.6 Sol',
+          'Mf: GLM 5.3',
+          'Mf: Deepseek V4 Flash (0731)'
+        ])
+        // The raw ids stay the wire apiModelIds regardless of the display mode.
+        expect(models.map((model) => model.apiModelId)).toEqual([
+          'custom-model',
+          'gpt-5.6-sol',
+          'mf/glm-5.3',
+          'mf/deepseek-v4-flash-0731'
+        ])
+      } finally {
+        MockMainPreferenceServiceUtils.setPreferenceValue(MODEL_DISPLAY_NAME_SHOW_RAW_ID, true)
+      }
     })
 
     it('getImageGenerationSupport returns the model block when present', async () => {

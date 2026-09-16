@@ -16,6 +16,7 @@
 
 import { isEqual } from 'es-toolkit/compat'
 
+import { application } from '@application'
 import type {
   ProtoModelConfig,
   ProtoProviderConfig,
@@ -43,7 +44,11 @@ import {
   MODEL_CAPABILITY,
   REASONING_EFFORT,
   REASONING_FORMAT_PROFILES,
-  selectFormatWire
+  selectFormatWire,
+  stripBedrockDottedVendorPrefix,
+  stripBedrockRevision,
+  stripDateSnapshot,
+  stripVariantQuantDateSuffixes
 } from '@cherrystudio/provider-registry'
 import { type RegistryFileName, RegistryLoader } from '@cherrystudio/provider-registry/node'
 import type { StoredEndpointConfigOverride } from '@data/db/schemas/userProvider'
@@ -327,6 +332,83 @@ export function inferCustomModelReasoning(
   if (!controls) return undefined
   const proto: ProtoReasoningSupport = { controls, ...deriveLegacyReasoningFields(controls) }
   return projectRuntimeReasoning(proto, profile)
+}
+
+/** Preference key: `true` shows the raw model id, `false` the decorated display name. */
+export const MODEL_DISPLAY_NAME_SHOW_RAW_ID = 'models.display_name.show_raw_id'
+
+/** Tokens that must stay upper-cased when a raw id is prettified (a lowercase word would mis-title-case). */
+const MODEL_NAME_ACRONYMS: Record<string, string> = {
+  api: 'API',
+  asr: 'ASR',
+  glm: 'GLM',
+  gpt: 'GPT',
+  hd: 'HD',
+  llm: 'LLM',
+  mt: 'MT',
+  ocr: 'OCR',
+  tts: 'TTS',
+  vl: 'VL'
+}
+
+/** Title-case a single id token: acronyms upper-case, a leading lowercase letter capitalized, existing casing preserved. */
+function titleCaseIdToken(token: string): string {
+  const acronym = MODEL_NAME_ACRONYMS[token.toLowerCase()]
+  if (acronym) return acronym
+  if (/^[a-z]/.test(token)) return token.charAt(0).toUpperCase() + token.slice(1)
+  return token
+}
+
+/** The trailing tokens `id` carries beyond `stem` (`stem` is a suffix-stripped prefix of `id`), separator trimmed. */
+function trailingRemainder(id: string, stem: string): string {
+  return id.length > stem.length ? id.slice(stem.length).replace(/^[-:@._]+/, '') : ''
+}
+
+/** Prettify one slash-less id segment: keep a trailing dated snapshot atomic in parens, split the rest on `-`, title-case each token. */
+function prettifyIdSegment(segment: string): string {
+  const stem = stripDateSnapshot(segment)
+  const date = trailingRemainder(segment, stem)
+  const pretty = stem.split('-').filter(Boolean).map(titleCaseIdToken).join(' ')
+  return date ? `${pretty} (${date})` : pretty
+}
+
+/**
+ * Decorated display name for a model resolved against a provider's live `/models` list — only used when
+ * the user opts out of raw-id display (`MODEL_DISPLAY_NAME_SHOW_RAW_ID` = false). The raw id is the only
+ * per-SKU identity, so the name must stay distinguishable between sibling ids that share one canonical
+ * catalog entry (`MiniMax-M2.1` vs `MiniMax/MiniMax-M2.1`, `qwen-plus` vs `qwen-plus-2025-12-01`).
+ *
+ * - Exact apiModelId match → the curated/override name verbatim (authoritative — never decorated).
+ * - Fuzzy (normalized) match → curated name plus a distinguishing suffix for the tokens normalization
+ *   stripped: a trailing dated snapshot / `:variant` / quant tag goes in parens (via the same canonical
+ *   stripper the matcher uses), and a vendor-namespace prefix — slash (`MiniMax/…`) or dotted Bedrock
+ *   ARN (`MiniMax.…`, `us.anthropic.…`) — is rendered `Prefix: `. A hyphen aggregator prefix
+ *   (`aihubmix-…`) is a prefix, not a stripped suffix, so it leaves no remainder and keeps the clean
+ *   curated name.
+ * - No catalog match → the raw id prettified.
+ */
+function deriveResolvedModelName(rawId: string, curatedName: string | null, canonicalApiId: string | null): string {
+  if (curatedName && canonicalApiId && rawId === canonicalApiId) return curatedName
+
+  const slashIdx = rawId.lastIndexOf('/')
+  const afterSlash = slashIdx >= 0 ? rawId.slice(slashIdx + 1) : rawId
+  // Normalization folds the dotted vendor prefix away, so the decoration has to restore it — otherwise
+  // `MiniMax.MiniMax-M2.1` and the bare `MiniMax-M2.1` resolve to the same name despite distinct ids.
+  const tail = afterSlash.slice(afterSlash.length - stripBedrockDottedVendorPrefix(afterSlash.toLowerCase()).length)
+
+  let name: string
+  if (curatedName) {
+    const suffix = trailingRemainder(tail, stripBedrockRevision(stripVariantQuantDateSuffixes(tail)))
+    name = suffix ? `${curatedName} (${suffix})` : curatedName
+  } else {
+    name = prettifyIdSegment(tail)
+  }
+
+  const namespaces = [
+    ...(slashIdx >= 0 ? rawId.slice(0, slashIdx).split('/').map(titleCaseIdToken) : []),
+    ...(tail.length < afterSlash.length ? [afterSlash.slice(0, afterSlash.length - tail.length - 1)] : [])
+  ]
+  return namespaces.length > 0 ? `${namespaces.join(': ')}: ${name}` : name
 }
 
 /** Create a minimal custom model used when a model ID has no registry match. */
@@ -1046,6 +1128,8 @@ class ProviderRegistryService {
   resolveModels(providerId: string, modelIds: string[]): Model[] {
     getDataService('ProviderService').assertAvailable(providerId)
     const providerContext = this.getEffectiveProviderContext(providerId)
+    // Default to the raw id (mirrors the schema default) unless the user opts into decorated names.
+    const showRawId = application.get('PreferenceService').get(MODEL_DISPLAY_NAME_SHOW_RAW_ID) !== false
 
     const results: Model[] = []
     const seen = new Set<string>()
@@ -1073,16 +1157,19 @@ class ProviderRegistryService {
         // (normalized) match would collapse distinct SKUs onto the canonical spelling (`MiniMax/MiniMax-M2.1`
         // → `MiniMax-M2.1`, `qwen-plus-2025-12-01` → `qwen-plus`), mis-routing the request and colliding
         // ids. `presetModelId` keeps the canonical link for metadata; the display `name` is the raw id
-        // itself so the pulled list shows exactly what the provider serves.
+        // (or the decorated name when the user opts into it), keeping the pulled list faithful to the
+        // provider's served ids.
+        const canonicalApiId = model.apiModelId ?? registryOverride?.apiModelId ?? null
         results.push({
           ...model,
           id: createUniqueModelId(providerId, modelId),
           apiModelId: modelId,
-          name: modelId,
+          name: showRawId ? modelId : deriveResolvedModelName(modelId, model.name, canonicalApiId),
           presetModelId: presetModel.id
         })
       } else {
-        results.push(createCustomModel(providerId, modelId, reasoningProfile.wire, serviceTierControl))
+        const custom = createCustomModel(providerId, modelId, reasoningProfile.wire, serviceTierControl)
+        results.push({ ...custom, name: showRawId ? modelId : deriveResolvedModelName(modelId, null, null) })
       }
     }
 
