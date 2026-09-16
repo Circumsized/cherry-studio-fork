@@ -129,16 +129,10 @@ async function enrichFetchedModels(providerId: string, fetchedModels: Partial<Mo
     }
 
     const merged = { ...base }
-    // An unmatched (custom) resolved row carries the raw id as its name. If the provider's
-    // /models returned a real display name — one that differs from the raw id — keep it instead
-    // of overwriting with the id. Matched rows (presetModelId set) own the curated name.
-    const keepFetchedName = !registry.presetModelId && !!base.name && base.name !== base.apiModelId
-
+    // The resolved row's `name` is the raw model id itself (`resolveModels` no longer decorates it),
+    // so the merge keeps the pulled list showing exactly the ids the provider serves.
     for (const field of REGISTRY_FIELDS) {
       if (field === 'endpointTypes' && base.endpointTypes?.length) {
-        continue
-      }
-      if (field === 'name' && keepFetchedName) {
         continue
       }
       const value = registry[field]
