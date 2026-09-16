@@ -1,6 +1,7 @@
 import { mockRendererLoggerService } from '@test-mocks/RendererLoggerService'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { preferenceService } from '@data/PreferenceService'
 import { ENDPOINT_TYPE, MODEL_CAPABILITY } from '@shared/data/types/model'
 
 import {
@@ -164,6 +165,34 @@ describe('fetchResolvedProviderModels', () => {
     const models = await fetchResolvedProviderModels('custom')
 
     expect(models[0].name).toBe('custom-model')
+  })
+
+  it('keeps a provider display name for an unmatched custom model in decorated mode', async () => {
+    await preferenceService.set('models.display_name.show_raw_id', false)
+    try {
+      listModelsMock.mockResolvedValueOnce([
+        {
+          id: 'custom::custom-model',
+          providerId: 'custom',
+          apiModelId: 'custom-model',
+          name: 'Provider Display Name'
+        }
+      ])
+      dataApiGetMock.mockResolvedValueOnce([
+        {
+          id: 'custom::custom-model',
+          providerId: 'custom',
+          apiModelId: 'custom-model',
+          name: 'Custom Model'
+        }
+      ])
+
+      const models = await fetchResolvedProviderModels('custom')
+
+      expect(models[0].name).toBe('Provider Display Name')
+    } finally {
+      await preferenceService.set('models.display_name.show_raw_id', true)
+    }
   })
 })
 

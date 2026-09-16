@@ -1,6 +1,7 @@
 import { isEmpty } from 'es-toolkit/compat'
 
 import { dataApiService } from '@data/DataApiService'
+import { preferenceService } from '@data/PreferenceService'
 import { loggerService } from '@logger'
 import { ipcApi } from '@renderer/ipc'
 import type { CreateModelDto } from '@shared/data/api/schemas/models'
@@ -90,6 +91,9 @@ async function enrichFetchedModels(providerId: string, fetchedModels: Partial<Mo
     }
   })) as Model[]
 
+  // Mirrors the schema default (raw id) unless the user opts into decorated names.
+  const showRawId = (await preferenceService.get('models.display_name.show_raw_id')) !== false
+
   const resolvedMap = new Map<string, Model>()
   for (const model of resolved) {
     const key = model.apiModelId ?? parseUniqueModelId(model.id).modelId
@@ -129,10 +133,15 @@ async function enrichFetchedModels(providerId: string, fetchedModels: Partial<Mo
     }
 
     const merged = { ...base }
-    // The resolved row's `name` is the raw model id itself (`resolveModels` no longer decorates it),
-    // so the merge keeps the pulled list showing exactly the ids the provider serves.
+    // In decorated mode an unmatched (custom) row only carries a prettified id as its name, so a real
+    // provider display name (≠ raw id) wins; in raw-id mode the resolved name is the raw id itself.
+    const keepFetchedName = !showRawId && !registry.presetModelId && !!base.name && base.name !== base.apiModelId
+
     for (const field of REGISTRY_FIELDS) {
       if (field === 'endpointTypes' && base.endpointTypes?.length) {
+        continue
+      }
+      if (field === 'name' && keepFetchedName) {
         continue
       }
       const value = registry[field]
